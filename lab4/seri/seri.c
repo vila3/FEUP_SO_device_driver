@@ -22,7 +22,6 @@ struct  seri_dev {
 	struct cdev cdev;
 	int cnt;
 	int check_timeout;
-	int sem;
 	struct kfifo *read_buffer;
 	spinlock_t *read_lock;
 	struct kfifo *write_buffer;
@@ -40,7 +39,7 @@ ssize_t device_write(struct file *filep, const char __user *buff, size_t count, 
 
 #define UART_BASE	0x03F8	// UART's base I/O port-address (COM1)
 #define SERI_COUNT	1
-#define KFIFO_SIZE	4
+#define KFIFO_SIZE	512
 
 dev_t dev_buffer;
 struct  seri_dev *dev;
@@ -117,8 +116,8 @@ static irqreturn_t int_handler(int irq, void *dev_id) {
 ssize_t device_write(struct file *filep, const char __user *buff, size_t count, loff_t *offp)
 {
 	struct  seri_dev *mdev;
-	char *mBuff = (char *)kzalloc(sizeof(char)*count+1, GFP_KERNEL);
-	unsigned char c, irq_flags;
+	char *mBuff = (char *)kzalloc(sizeof(char)*count, GFP_KERNEL);
+	unsigned char c;
 	int n = copy_from_user(mBuff, buff, count);
 	int i = 0, cnt=0;
 	if(n!=0) {
@@ -127,32 +126,28 @@ ssize_t device_write(struct file *filep, const char __user *buff, size_t count, 
 	}
 	mdev = filep->private_data;
 
-	if ((count - mdev->write_buffer->size) > 0) {
-		kfifo_put(mdev->write_buffer, mBuff, mdev->write_buffer->size);
-		i = mdev->write_buffer->size;
-	} else {
-		kfifo_put(mdev->write_buffer, mBuff, count);
-		i = count;
-	}
-	printk(KERN_ALERT " -k i=%d | size=%d | count=%d\n", i, mdev->write_buffer->size, count);
+	// printk(KERN_ALERT " -k i=%d | size=%d | count=%d\n", i, mdev->write_buffer->size, count);
 
 	while (i < count) {
-		if(mdev->idle) {
+		if(kfifo_len(mdev->write_buffer) == 0) {
+			if ((int)(count - (i + mdev->write_buffer->size)) >= 0) {
+				kfifo_put(mdev->write_buffer, mBuff + i, mdev->write_buffer->size);
+				i += mdev->write_buffer->size;
+			} else {
+				kfifo_put(mdev->write_buffer, mBuff + i, (count - i));
+				i = count;
+			}
 			kfifo_get(mdev->write_buffer, &c, 1);
 			outb(c, UART_BASE + UART_TX);
-			printk(KERN_ALERT "i=%d\n", i);
 			cnt++;
 		}
 		if (kfifo_len(mdev->write_buffer) == mdev->write_buffer->size) {
 			if(wait_event_interruptible(mdev->wq, mdev->write_flag != 0) != 0)
 				return -ERESTARTSYS;
 			mdev->write_flag = 0;
-			continue;
 		}
-		if (kfifo_put(mdev->write_buffer, mBuff + i, 1))
-			i++;
 	}
-	printk(KERN_ALERT " -k i=%d | cnt=%d\n", i, cnt);
+	// printk(KERN_ALERT " -k i=%d | cnt=%d\n", i, cnt);
 	kfree(mBuff);
 	return i;
 }
@@ -214,13 +209,11 @@ static int echo_init(void)
 	dev[0].cdev.owner = THIS_MODULE;
 	dev[0].check_timeout = 0;
 	dev[0].idle = 0;
+	// initialize spinlock_t used on kfifo
 	spin_lock_init(dev[0].read_lock);
 	spin_lock_init(dev[0].write_lock);
 	// initialize buffers
-	spin_lock_init(tmp_lock);
 	dev[0].read_buffer = kfifo_alloc(KFIFO_SIZE, GFP_KERNEL, dev[0].read_lock);
-	tmp_lock = NULL;
-	spin_lock_init(tmp_lock);
 	dev[0].write_buffer = kfifo_alloc(KFIFO_SIZE, GFP_KERNEL, dev[0].write_lock);
 
 	vft = cdev_add(&dev[0].cdev, dev_buffer, 1);

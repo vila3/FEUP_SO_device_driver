@@ -19,6 +19,8 @@ struct serp_dev {
 	struct cdev cdev;
 	int cnt;
 	int check_timeout;
+	int n;
+	int n_nothing;
 };
 
 static int device_open(struct inode *inodep, struct file *filep);
@@ -66,7 +68,7 @@ static int device_open(struct inode *inodep, struct file *filep)
 	nonseekable_open(inodep, filep);
 
 	// empty the UART buffer if exist
-	while((inb(UART_BASE + UART_LSR) & (UART_LSR_DR | UART_LSR_OE)) != 0) inb(UART_BASE + UART_RX);
+	while(inb(UART_BASE + UART_LSR) & (UART_LSR_DR | UART_LSR_OE)) inb(UART_BASE + UART_RX);
 	return 0;
 }
 
@@ -105,21 +107,22 @@ ssize_t device_read(struct file *filep, char __user *buff, size_t count, loff_t 
 	struct serp_dev *mdev;
 	char *mBuff = kzalloc(sizeof(char)*count, GFP_KERNEL);
 	unsigned char line_status;
-	int n = 0, n_nothing = 0;
 	if (!mBuff) {
 		return -1;
 	}
 	mdev = filep->private_data;
+	mdev->n = 0;
+	mdev->n_nothing = 0;
 
 	while (1) {
 		line_status = inb(UART_BASE + UART_LSR);
 		if ((line_status & UART_LSR_DR) == 0) {
 			// printk(KERN_ALERT "Waiting...");
 			msleep_interruptible(1);
-			n_nothing++;
+			mdev->n_nothing++;
 			// printk(KERN_ALERT "(%d, %d)\n", n_nothing, mdev->check_timeout);
-			if (n_nothing > 100 && mdev->check_timeout) {
-				if (n==0) {
+			if (mdev->n_nothing > 100 && mdev->check_timeout) {
+				if (mdev->n==0) {
 					printk(KERN_ALERT " -k Waiting too long for a char, exiting!\n");
 					return 0;
 				}
@@ -128,23 +131,23 @@ ssize_t device_read(struct file *filep, char __user *buff, size_t count, loff_t 
 		} else {
 			if ((line_status & UART_LSR_OE) != 0) {
 				kfree(mBuff);
-				printk(KERN_ALERT "Overrun error!");
+				printk(KERN_ALERT " -k Overrun error!\n");
 				return -EIO;
             }
-			mBuff[n++] = inb(UART_BASE + UART_RX);
+			mBuff[mdev->n++] = inb(UART_BASE + UART_RX);
 			// printk(KERN_ALERT "%c", mBuff[n-1]);
-			if (n == count)
+			if (mdev->n == count)
 				break;
-			n_nothing = 0;
+			mdev->n_nothing = 0;
 			mdev->check_timeout = 1;
 		}
 	}
-	if (copy_to_user(buff, mBuff, n) > 0) {
+	if (copy_to_user(buff, mBuff, mdev->n) > 0) {
 		printk(KERN_ALERT " -k Error copy data to user...\n");
 		return -1;
 	}
 	kfree(mBuff);
-	return n;
+	return mdev->n;
 }
 
 static int echo_init(void)

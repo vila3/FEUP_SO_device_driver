@@ -6,3 +6,4 @@ core
 *.ko
 *.mod.c
 .tmp_versions
+*.o.d
