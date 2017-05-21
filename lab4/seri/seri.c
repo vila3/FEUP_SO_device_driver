@@ -20,7 +20,7 @@ MODULE_LICENSE("Dual BSD/GPL");
 
 struct  seri_dev {
 	struct cdev cdev;
-	int cnt;
+	int error;
 	int check_timeout;
 	struct kfifo *read_buffer;
 	spinlock_t *read_lock;
@@ -53,40 +53,18 @@ struct file_operations fops = {
 	.write = device_write
 };
 
-static int device_open(struct inode *inodep, struct file *filep)
-{
-	struct  seri_dev *mdev;
-	mdev = container_of(inodep->i_cdev, struct  seri_dev, cdev);
-	filep->private_data = mdev;
-	printk(KERN_ALERT " -k Device was open.\n");
-	nonseekable_open(inodep, filep);
-
-	init_waitqueue_head(&mdev->wq);
-	mdev->read_flag = 0;
-	mdev->write_flag = 0;
-	mdev->check_timeout = 0;
-
-	// empty the UART buffer if exist
-	while(inb(UART_BASE + UART_LSR) & (UART_LSR_DR | UART_LSR_OE)) inb(UART_BASE + UART_RX);
-	return 0;
-}
-
-static int device_release(struct inode *inodep, struct file *filep)
-{
-	struct  seri_dev *mdev;
-	mdev = filep->private_data;
-	mdev->read_flag = 0;
-	mdev->write_flag = 0;
-	filep->private_data = NULL;
-	printk(KERN_ALERT " -k Device was release.\n");
-	return 0;
-}
-
 static irqreturn_t int_handler(int irq, void *dev_id) {
-	unsigned char iir, c;
+	unsigned char iir, c, line_status;
 	struct seri_dev *mdev = dev_id;
 	// printk(" -k Interrupt\n");
 	iir = inb(UART_BASE + UART_IIR);
+	if (iir & UART_IIR_RLSI) {
+		line_status = inb(UART_BASE + UART_LSR);
+		if (line_status & UART_LSR_OE) {
+			mdev->error = -EIO;
+			return IRQ_HANDLED;
+		}
+	}
 	// read
 	if (iir & UART_IIR_RDI) {
 		c = inb(UART_BASE + UART_RX);
@@ -112,14 +90,46 @@ static irqreturn_t int_handler(int irq, void *dev_id) {
 	}
 	return IRQ_NONE;
 }
-// ---------------------
+
+static int device_open(struct inode *inodep, struct file *filep)
+{
+	struct  seri_dev *mdev;
+	mdev = container_of(inodep->i_cdev, struct  seri_dev, cdev);
+	filep->private_data = mdev;
+	printk(KERN_ALERT " -k Device was open.\n");
+	nonseekable_open(inodep, filep);
+
+	request_irq(4, int_handler, SA_INTERRUPT, driver_name, mdev);
+
+	init_waitqueue_head(&mdev->wq);
+	mdev->read_flag = 0;
+	mdev->write_flag = 0;
+	mdev->check_timeout = 0;
+
+	// reset Line Status Register
+	inb(UART_BASE + UART_LSR);
+	return 0;
+}
+
+static int device_release(struct inode *inodep, struct file *filep)
+{
+	struct  seri_dev *mdev;
+	mdev = filep->private_data;
+	free_irq(4, mdev);
+	mdev->read_flag = 0;
+	mdev->write_flag = 0;
+	filep->private_data = NULL;
+	printk(KERN_ALERT " -k Device was release.\n");
+	return 0;
+}
+
 ssize_t device_write(struct file *filep, const char __user *buff, size_t count, loff_t *offp)
 {
 	struct  seri_dev *mdev;
 	char *mBuff = (char *)kzalloc(sizeof(char)*count, GFP_KERNEL);
 	unsigned char c;
 	int n = copy_from_user(mBuff, buff, count);
-	int i = 0, cnt=0;
+	int i = 0;
 	if(n!=0) {
 		printk(KERN_ALERT " -k Ups! Couldn't get data to write! (%d)", n);
 		return 0;
@@ -139,7 +149,6 @@ ssize_t device_write(struct file *filep, const char __user *buff, size_t count, 
 			}
 			kfifo_get(mdev->write_buffer, &c, 1);
 			outb(c, UART_BASE + UART_TX);
-			cnt++;
 		}
 		if (kfifo_len(mdev->write_buffer) == mdev->write_buffer->size) {
 			if(wait_event_interruptible(mdev->wq, mdev->write_flag != 0) != 0)
@@ -147,7 +156,7 @@ ssize_t device_write(struct file *filep, const char __user *buff, size_t count, 
 			mdev->write_flag = 0;
 		}
 	}
-	// printk(KERN_ALERT " -k i=%d | cnt=%d\n", i, cnt);
+	// printk(KERN_ALERT " -k i=%d\n", i);
 	kfree(mBuff);
 	return i;
 }
@@ -156,7 +165,7 @@ ssize_t device_read(struct file *filep, char __user *buff, size_t count, loff_t 
 {
 	struct  seri_dev *mdev;
 	char *mBuff = kzalloc(sizeof(char)*count, GFP_KERNEL);
-	int n=0, result;
+	int n=0, result, len;
 	if (!mBuff) {
 		return -1;
 	}
@@ -173,11 +182,14 @@ ssize_t device_read(struct file *filep, char __user *buff, size_t count, loff_t 
 			default:
 				mdev->read_flag = 0;
 		}
+		if (mdev->error != 0)
+			return mdev->error;
 	}
 
 	do {
-		kfifo_get(mdev->read_buffer, mBuff + n, 1);
-		n++;
+		len = kfifo_len(mdev->read_buffer);
+		kfifo_get(mdev->read_buffer, mBuff + n, len);
+		n+=len;
 	} while (kfifo_len(mdev->read_buffer) > 0);
 
 	if (copy_to_user(buff, mBuff, n) > 0) {
@@ -193,7 +205,7 @@ static int echo_init(void)
 	int vft;
 	struct resource *rsc;
 	unsigned char lcr;
-	spinlock_t *tmp_lock;
+
 	vft = alloc_chrdev_region(&dev_buffer, 0, SERI_COUNT, driver_name);
 	if (vft < 0) {
 	  printk(KERN_INFO " -k Major number allocation is failed\n");
@@ -239,9 +251,7 @@ static int echo_init(void)
 	outb(0x60, UART_BASE + UART_DLL);
 	lcr &= ~UART_LCR_DLAB;
 	outb(lcr, UART_BASE + UART_LCR);
-	outb(UART_IER_RDI | UART_IER_THRI, UART_BASE + UART_IER);
-
-	request_irq(4, int_handler, SA_INTERRUPT, driver_name, &dev[0]);
+	outb(UART_IER_RDI | UART_IER_THRI | UART_IER_RLSI, UART_BASE + UART_IER);
 
 	printk(KERN_ALERT " -k Connection established successfully!\n");
 
@@ -251,7 +261,6 @@ static int echo_init(void)
 static void echo_exit(void)
 {
 	int major_num = MAJOR(dev_buffer);
-	free_irq(4, &dev[0]);
 	release_region(UART_BASE, 1);
 	kfree(dev[0].write_buffer->lock);
 	kfifo_free(dev[0].write_buffer);
