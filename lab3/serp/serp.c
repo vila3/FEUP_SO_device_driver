@@ -43,22 +43,6 @@ struct file_operations fops = {
 	.write = device_write
 };
 
-int sendMessage(char *message, int count)
-{
-	int i = 0;
-	if (count <= 0) {
-		count = 128;
-	}
-	while (1) {
-		if (message[i] == '\0' || (i >= count))
-			break;
-		while ((inb(UART_BASE + UART_LSR) & UART_LSR_THRE) == 0)
-			msleep_interruptible(1);
-		outb(message[i++], UART_BASE + UART_TX);
-	}
-	return i;
-}
-
 static int device_open(struct inode *inodep, struct file *filep)
 {
 	struct serp_dev *mdev;
@@ -193,8 +177,6 @@ static int echo_init(void)
 	outb(0x60, UART_BASE + UART_DLL);
 	lcr &= ~UART_LCR_DLAB;
 	outb(lcr, UART_BASE + UART_LCR);
-
-	sendMessage("Connection established successfully!\n", 0);
 
 	printk(KERN_ALERT " -k Connection established successfully!\n");
 
